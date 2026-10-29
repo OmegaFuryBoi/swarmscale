@@ -1,0 +1,8 @@
+# compiled programs
+swarm
+*.o
+*.out
+*.exe
+
+# editor settings
+.vscode/
