@@ -1,6 +1,8 @@
 # compiled programs
 swarm
 swarm_bench
+swarm_cuda
+swarm_cuda_bench
 *.o
 *.out
 *.exe
