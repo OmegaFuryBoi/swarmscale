@@ -9,7 +9,10 @@ WORLD = None
 data = np.loadtxt("frames.csv", delimiter=",", skiprows=1)
 steps = np.unique(data[:, 0])
 frames = [data[data[:, 0] == s] for s in steps]
-WORLD = np.sqrt(len(frames[0]) / 0.1)        
+WORLD = np.sqrt(len(frames[0]) / 0.1)
+dens = np.loadtxt("density.csv", delimiter=",")
+GRID = int(np.sqrt(dens.shape[1] - 1))
+grids = [row[1:].reshape(GRID, GRID) for row in dens]        
 
 fig, ax = plt.subplots(figsize=(6, 6))
 ax.set_xlim(0, WORLD)
@@ -21,6 +24,10 @@ ax.set_yticks([])
 def split(f):
     return f[f[:, 5] == 0], f[f[:, 5] == 1]   
 
+heat = ax.imshow(grids[0], origin="lower", extent=(0, WORLD, 0, WORLD),
+                 cmap="Oranges", vmin=0, vmax=np.percentile(dens[:, 1:], 99.5),
+                 interpolation="bilinear")
+
 prey, pred = split(frames[0])
 prey_arrows = ax.quiver(prey[:, 1], prey[:, 2], prey[:, 3], prey[:, 4],
                         angles="xy", scale_units="xy", scale=1.5,
@@ -31,13 +38,14 @@ pred_arrows = ax.quiver(pred[:, 1], pred[:, 2], pred[:, 3], pred[:, 4],
 title = ax.set_title("")
 
 def update(k):
+    heat.set_data(grids[k])
     prey, pred = split(frames[k])
     prey_arrows.set_offsets(prey[:, 1:3])
     prey_arrows.set_UVC(prey[:, 3], prey[:, 4])
     pred_arrows.set_offsets(pred[:, 1:3])
     pred_arrows.set_UVC(pred[:, 3], pred[:, 4])
     title.set_text(f"step {int(steps[k])}")
-    return prey_arrows, pred_arrows, title
+    return heat, prey_arrows, pred_arrows, title
 
 anim = FuncAnimation(fig, update, frames=len(frames))
 anim.save("swarm.gif", writer=PillowWriter(fps=20))

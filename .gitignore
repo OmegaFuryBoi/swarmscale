@@ -12,4 +12,5 @@ swarm_cuda_bench
 
 # simulation output
 frames.csv
+density.csv
 *.gif

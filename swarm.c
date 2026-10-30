@@ -33,6 +33,9 @@
 #define MAXCAND    128    // max prey a predator considers when planning
 #define NLEAD      16     // aiming angles a predator tries for each prey
 #define PLAN_STEPS 200    // how far ahead (in steps) a predator simulates a chase
+#define GRID       64     // density grid is GRID x GRID cells
+#define BLUR_R     2      // blur mask radius: mask has 2*BLUR_R+1 weights
+#define CONFUSION  20.0f  // penalty (in steps) per unit of crowding around a prey
 
 float W, H;              // world size, set in main from N and DENSITY
 float x[N], y[N];        // positions
@@ -57,6 +60,10 @@ int   nb_best_j[N];
 int   nb_ncand[NPRED];
 int   nb_cand[NPRED * MAXCAND];
 float nb_cdx[NPRED * MAXCAND], nb_cdy[NPRED * MAXCAND];
+float dens_raw[GRID * GRID];     
+float dens_tmp[GRID * GRID];     
+float dens[GRID * GRID];       
+float mask[2 * BLUR_R + 1];     
 
 float rand_range(float lo, float hi)
 {
@@ -102,13 +109,74 @@ float wrap_delta(float d, float size)
     return d;
 }
 
+void init_mask(void)
+{
+    float sum = 0;
+    for (int k = -BLUR_R; k <= BLUR_R; k++) {
+        mask[k + BLUR_R] = expf(-(k * k) / 2.0f);
+        sum += mask[k + BLUR_R];
+    }
+    for (int k = 0; k < 2 * BLUR_R + 1; k++)
+        mask[k] /= sum;
+}
+
+int cell_of(float pos, float size)
+{
+    int c = (int)(pos / size * GRID);
+    if (c < 0) c = 0;
+    if (c >= GRID) c = GRID - 1;
+    return c;
+}
+
+void compute_density(void)
+{
+    #pragma omp parallel for
+    for (int c = 0; c < GRID * GRID; c++)
+        dens_raw[c] = 0;
+
+    #pragma omp parallel for
+    for (int i = 0; i < N; i++) {
+        if (type[i] != PREY) continue;
+        int c = cell_of(y[i], H) * GRID + cell_of(x[i], W);
+        #pragma omp atomic
+        dens_raw[c] += 1.0f;
+    }
+
+    #pragma omp parallel for
+    for (int row = 0; row < GRID; row++)
+        for (int col = 0; col < GRID; col++) {
+            float s = 0;
+            for (int k = -BLUR_R; k <= BLUR_R; k++)
+                s += mask[k + BLUR_R] * dens_raw[row * GRID + (col + k + GRID) % GRID];
+            dens_tmp[row * GRID + col] = s;
+        }
+
+    #pragma omp parallel for
+    for (int row = 0; row < GRID; row++)
+        for (int col = 0; col < GRID; col++) {
+            float s = 0;
+            for (int k = -BLUR_R; k <= BLUR_R; k++)
+                s += mask[k + BLUR_R] * dens_tmp[((row + k + GRID) % GRID) * GRID + col];
+            dens[row * GRID + col] = s;
+        }
+}
+
+float density_at(float px, float py)
+{
+    px = wrap(px, W);
+    py = wrap(py, H);
+    return dens[cell_of(py, H) * GRID + cell_of(px, W)];
+}
+
 int plan_hunt(int ncand, const int cand[], const float cdx[], const float cdy[],
               float *hx, float *hy)
 {
-    int best_prey = -1, best_time = PLAN_STEPS + 1;
+    int best_prey = -1;
+    float best_score = PLAN_STEPS + 1;
 
     for (int c = 0; c < ncand; c++) {
         int j = cand[c];
+        float crowd = CONFUSION * density_at(x[j], y[j]);
         float base = atan2f(cdy[c], cdx[c]);           
         for (int k = 0; k < NLEAD; k++) {
             float angle = base + (k - NLEAD / 2) * 0.15f; 
@@ -122,8 +190,8 @@ int plan_hunt(int ncand, const int cand[], const float cdx[], const float cdy[],
                 qy += vy[j] * DT;
                 float ex = qx - px, ey = qy - py;
                 if (ex * ex + ey * ey < RCATCH * RCATCH) { 
-                    if (t < best_time) {
-                        best_time = t;
+                    if (t + crowd < best_score) {
+                        best_score = t + crowd;
                         best_prey = j;
                         *hx = ux;
                         *hy = uy;
@@ -285,6 +353,14 @@ int catch_prey(void)
     return caught;
 }
 
+void save_density(FILE *f, int step)
+{
+    fprintf(f, "%d", step);
+    for (int c = 0; c < GRID * GRID; c++)
+        fprintf(f, ",%.3f", dens[c]);
+    fprintf(f, "\n");
+}
+
 void save_frame(FILE *f, int step)
 {
     for (int i = 0; i < N; i++)
@@ -310,7 +386,9 @@ int main(void)
     srand(42);
     init_agents();
 
+    init_mask();
     FILE *out = NULL;
+    FILE *dout = NULL;
     if (SAVE_EVERY > 0) {
         out = fopen("frames.csv", "w");
         if (out == NULL) {
@@ -318,24 +396,30 @@ int main(void)
             return 1;
         }
         fprintf(out, "step,x,y,vx,vy,type\n");
+          dout = fopen("density.csv", "w");
     }
 
-    double neigh_time = 0, decide_time = 0;
+    double neigh_time = 0, density_time = 0, decide_time = 0;
     double start = omp_get_wtime();
 
     for (int step = 0; step < STEPS; step++) {
         double t0 = omp_get_wtime();
         neighbour_search();
         double t1 = omp_get_wtime();
-        decide_agents();
+        compute_density();
         double t2 = omp_get_wtime();
-        neigh_time  += t1 - t0;
-        decide_time += t2 - t1;
+        decide_agents();
+        double t3 = omp_get_wtime();
+        neigh_time   += t1 - t0;
+        density_time += t2 - t1;
+        decide_time  += t3 - t2;
 
         total_catches += catch_prey();
         move_agents();
-        if (SAVE_EVERY > 0 && step % SAVE_EVERY == 0)
+        if (SAVE_EVERY > 0 && step % SAVE_EVERY == 0) {
             save_frame(out, step);
+            save_density(dout, step);
+       }
         if (step % 100 == 0)
             printf("step %4d: polarization %.3f | avg neighbours %5.1f | fleeing %3d | catches %d\n",
                    step, polarization(), avg_neighbours, num_fleeing, total_catches);
@@ -345,6 +429,7 @@ int main(void)
     printf("final polarization: %.3f\n", polarization());
     printf("total time      : %.3f s (%.2f ms per step)\n", total_time, 1000 * total_time / STEPS);
     printf("neighbour search: %.3f s (%.1f%% of total)\n", neigh_time, 100 * neigh_time / total_time);
+    printf("density field   : %.3f s (%.1f%% of total)\n", density_time, 100 * density_time / total_time);
     printf("decide agents   : %.3f s (%.1f%% of total)\n", decide_time, 100 * decide_time / total_time);
     
     int nthreads = omp_get_max_threads();
@@ -361,7 +446,8 @@ int main(void)
            max_busy / (sum_busy / nthreads));
     if (out != NULL) {
         fclose(out);
-        printf("saved frames.csv\n");
+        fclose(dout);
+        printf("saved frames.csv and density.csv\n");
     }
     return 0;
 }
