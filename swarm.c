@@ -89,8 +89,9 @@ float wrap_delta(float d, float size)
 void flock_agents(void)
 {
     long total_neighbours = 0, total_too_close = 0;
-    num_fleeing = 0;
+    int fleeing = 0;
 
+    #pragma omp parallel for schedule(runtime) reduction(+:total_neighbours, total_too_close, fleeing)
     for (int i = 0; i < N; i++) {
         float sum_vx = 0, sum_vy = 0;
         float sum_dx = 0, sum_dy = 0;
@@ -142,7 +143,7 @@ void flock_agents(void)
                 float d = sqrtf(best_d2);
                 nvx[i] -= FLEE * VMAX * best_dx / d;
                 nvy[i] -= FLEE * VMAX * best_dy / d;
-                num_fleeing++;
+                fleeing++;
             }
             total_neighbours += count;
         } else {                                  
@@ -161,11 +162,13 @@ void flock_agents(void)
         }
     }
 
+    #pragma omp parallel for
     for (int i = 0; i < N; i++) {
         vx[i] = nvx[i];
         vy[i] = nvy[i];
     }
 
+    num_fleeing    = fleeing;
     avg_neighbours = (float)total_neighbours / (N - NPRED);
     avg_too_close  = (float)total_too_close / (N - NPRED);
 }
@@ -206,7 +209,8 @@ float polarization(void)
 int main(void)
 {
     W = H = sqrtf(N / DENSITY);  // keep the same crowding for any N
-    printf("N = %d agents, world %.1f x %.1f, %d steps\n", N, W, H, STEPS);
+    printf("N = %d agents, world %.1f x %.1f, %d steps, %d threads\n",
+           N, W, H, STEPS, omp_get_max_threads());
 
     srand(42);
     init_agents();
