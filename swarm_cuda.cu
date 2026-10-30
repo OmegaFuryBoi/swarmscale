@@ -34,6 +34,9 @@
 #define MAXCAND    128    // max prey a predator considers when planning
 #define NLEAD      16     // aiming angles a predator tries for each prey
 #define PLAN_STEPS 200    // how far ahead (in steps) a predator simulates a chase
+#define GRID       64     // density grid is GRID x GRID cells
+#define BLUR_R     2      // blur mask radius: mask has 2*BLUR_R+1 weights
+#define CONFUSION  20.0f  // penalty (in steps) per unit of crowding around a prey
 
 float W, H;              // world size, set in main from N and DENSITY
 float x[N], y[N];        // positions
@@ -58,6 +61,10 @@ int   nb_best_j[N];
 int   nb_ncand[NPRED];
 int   nb_cand[NPRED * MAXCAND];
 float nb_cdx[NPRED * MAXCAND], nb_cdy[NPRED * MAXCAND];
+float dens_raw[GRID * GRID];     
+float dens_tmp[GRID * GRID];     
+float dens[GRID * GRID];       
+float mask[2 * BLUR_R + 1];     
 
 float rand_range(float lo, float hi)
 {
@@ -103,13 +110,41 @@ float wrap_delta(float d, float size)
     return d;
 }
 
+void init_mask(void)
+{
+    float sum = 0;
+    for (int k = -BLUR_R; k <= BLUR_R; k++) {
+        mask[k + BLUR_R] = expf(-(k * k) / 2.0f);
+        sum += mask[k + BLUR_R];
+    }
+    for (int k = 0; k < 2 * BLUR_R + 1; k++)
+        mask[k] /= sum;
+}
+
+int cell_of(float pos, float size)
+{
+    int c = (int)(pos / size * GRID);
+    if (c < 0) c = 0;
+    if (c >= GRID) c = GRID - 1;
+    return c;
+}
+
+float density_at(float px, float py)
+{
+    px = wrap(px, W);
+    py = wrap(py, H);
+    return dens[cell_of(py, H) * GRID + cell_of(px, W)];
+}
+
 int plan_hunt(int ncand, const int cand[], const float cdx[], const float cdy[],
               float *hx, float *hy)
 {
-    int best_prey = -1, best_time = PLAN_STEPS + 1;
+    int best_prey = -1;
+    float best_score = PLAN_STEPS + 1;
 
     for (int c = 0; c < ncand; c++) {
         int j = cand[c];
+        float crowd = CONFUSION * density_at(x[j], y[j]);
         float base = atan2f(cdy[c], cdx[c]);           
         for (int k = 0; k < NLEAD; k++) {
             float angle = base + (k - NLEAD / 2) * 0.15f; 
@@ -123,8 +158,8 @@ int plan_hunt(int ncand, const int cand[], const float cdx[], const float cdy[],
                 qy += vy[j] * DT;
                 float ex = qx - px, ey = qy - py;
                 if (ex * ex + ey * ey < RCATCH * RCATCH) { 
-                    if (t < best_time) {
-                        best_time = t;
+                    if (t + crowd < best_score) {
+                        best_score = t + crowd;
                         best_prey = j;
                         *hx = ux;
                         *hy = uy;
@@ -216,6 +251,8 @@ float *d_nb_cdx, *d_nb_cdy;
 
 cudaEvent_t ev_start, ev_stop;
 float kernel_ms = 0;
+float *d_dens_raw, *d_dens_tmp, *d_dens, *d_mask;
+float density_ms = 0;
 
 void check(cudaError_t err, const char *what)
 {
@@ -257,6 +294,12 @@ void gpu_init(void)
     check(cudaMalloc((void **)&d_nb_cdy, fC), "cudaMalloc");
 
     check(cudaMemcpy(d_type, type, iN, cudaMemcpyHostToDevice), "copy type");
+    int fG = GRID * GRID * sizeof(float);
+    check(cudaMalloc((void **)&d_dens_raw, fG), "cudaMalloc");
+    check(cudaMalloc((void **)&d_dens_tmp, fG), "cudaMalloc");
+    check(cudaMalloc((void **)&d_dens, fG), "cudaMalloc");
+    check(cudaMalloc((void **)&d_mask, (2 * BLUR_R + 1) * sizeof(float)), "cudaMalloc");
+    check(cudaMemcpy(d_mask, mask, (2 * BLUR_R + 1) * sizeof(float), cudaMemcpyHostToDevice), "copy mask");
 
     cudaEventCreate(&ev_start);
     cudaEventCreate(&ev_stop);
@@ -271,6 +314,7 @@ void gpu_free(void)
     cudaFree(d_nb_ncand); cudaFree(d_nb_cand); cudaFree(d_nb_cdx); cudaFree(d_nb_cdy);
     cudaEventDestroy(ev_start);
     cudaEventDestroy(ev_stop);
+    cudaFree(d_dens_raw); cudaFree(d_dens_tmp); cudaFree(d_dens); cudaFree(d_mask);
 }
 
 void neighbour_search(void)
@@ -315,6 +359,65 @@ void neighbour_search(void)
     check(cudaMemcpy(nb_cand, d_nb_cand, iC, cudaMemcpyDeviceToHost), "copy back");
     check(cudaMemcpy(nb_cdx, d_nb_cdx, fC, cudaMemcpyDeviceToHost), "copy back");
     check(cudaMemcpy(nb_cdy, d_nb_cdy, fC, cudaMemcpyDeviceToHost), "copy back");
+}
+
+__device__ int cell_of_gpu(float pos, float size)
+{
+    int c = (int)(pos / size * GRID);
+    if (c < 0) c = 0;
+    if (c >= GRID) c = GRID - 1;
+    return c;
+}
+
+__global__ void deposit_kernel(const float *x, const float *y, const int *type,
+                               float W, float H, float *dens_raw)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N || type[i] != PREY) return;
+    int c = cell_of_gpu(y[i], H) * GRID + cell_of_gpu(x[i], W);
+    atomicAdd(&dens_raw[c], 1.0f);
+}
+
+__global__ void blur_rows_kernel(const float *in, float *out, const float *mask)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= GRID * GRID) return;
+    int row = c / GRID, col = c % GRID;
+    float s = 0;
+    for (int k = -BLUR_R; k <= BLUR_R; k++)
+        s += mask[k + BLUR_R] * in[row * GRID + (col + k + GRID) % GRID];
+    out[c] = s;
+}
+
+__global__ void blur_cols_kernel(const float *in, float *out, const float *mask)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= GRID * GRID) return;
+    int row = c / GRID, col = c % GRID;
+    float s = 0;
+    for (int k = -BLUR_R; k <= BLUR_R; k++)
+        s += mask[k + BLUR_R] * in[((row + k + GRID) % GRID) * GRID + col];
+    out[c] = s;
+}
+
+void compute_density(void)
+{
+    int threads = 256;
+    int cells = GRID * GRID;
+
+    cudaEventRecord(ev_start);
+    check(cudaMemset(d_dens_raw, 0, cells * sizeof(float)), "cudaMemset");
+    deposit_kernel<<<(N + threads - 1) / threads, threads>>>(d_x, d_y, d_type, W, H, d_dens_raw);
+    blur_rows_kernel<<<(cells + threads - 1) / threads, threads>>>(d_dens_raw, d_dens_tmp, d_mask);
+    blur_cols_kernel<<<(cells + threads - 1) / threads, threads>>>(d_dens_tmp, d_dens, d_mask);
+    cudaEventRecord(ev_stop);
+    check(cudaGetLastError(), "density kernels");
+    cudaEventSynchronize(ev_stop);
+    float ms;
+    cudaEventElapsedTime(&ms, ev_start, ev_stop);
+    density_ms += ms;
+
+    check(cudaMemcpy(dens, d_dens, cells * sizeof(float), cudaMemcpyDeviceToHost), "copy density");
 }
 
 void decide_agents(void)
@@ -410,6 +513,14 @@ int catch_prey(void)
     return caught;
 }
 
+void save_density(FILE *f, int step)
+{
+    fprintf(f, "%d", step);
+    for (int c = 0; c < GRID * GRID; c++)
+        fprintf(f, ",%.3f", dens[c]);
+    fprintf(f, "\n");
+}
+
 void save_frame(FILE *f, int step)
 {
     for (int i = 0; i < N; i++)
@@ -434,9 +545,11 @@ int main(void)
 
     srand(42);
     init_agents();
+    init_mask();
     gpu_init();
 
     FILE *out = NULL;
+    FILE *dout = NULL;
     if (SAVE_EVERY > 0) {
         out = fopen("frames.csv", "w");
         if (out == NULL) {
@@ -444,24 +557,30 @@ int main(void)
             return 1;
         }
         fprintf(out, "step,x,y,vx,vy,type\n");
+          dout = fopen("density.csv", "w");
     }
 
-    double neigh_time = 0, decide_time = 0;
+    double neigh_time = 0, density_time = 0, decide_time = 0;
     double start = omp_get_wtime();
 
     for (int step = 0; step < STEPS; step++) {
         double t0 = omp_get_wtime();
         neighbour_search();
         double t1 = omp_get_wtime();
-        decide_agents();
+        compute_density();
         double t2 = omp_get_wtime();
-        neigh_time  += t1 - t0;
-        decide_time += t2 - t1;
+        decide_agents();
+        double t3 = omp_get_wtime();
+        neigh_time   += t1 - t0;
+        density_time += t2 - t1;
+        decide_time  += t3 - t2;
 
         total_catches += catch_prey();
         move_agents();
-        if (SAVE_EVERY > 0 && step % SAVE_EVERY == 0)
+        if (SAVE_EVERY > 0 && step % SAVE_EVERY == 0) {
             save_frame(out, step);
+            save_density(dout, step);
+       }
         if (step % 100 == 0)
             printf("step %4d: polarization %.3f | avg neighbours %5.1f | fleeing %3d | catches %d\n",
                    step, polarization(), avg_neighbours, num_fleeing, total_catches);
@@ -473,6 +592,9 @@ int main(void)
     printf("neighbour search: %.3f s (%.1f%% of total)\n", neigh_time, 100 * neigh_time / total_time);
     printf("  GPU kernel    : %.3f s, copies + launch: %.3f s\n",
              kernel_ms / 1000, neigh_time - kernel_ms / 1000);
+    printf("density field   : %.3f s (%.1f%% of total)\n", density_time, 100 * density_time / total_time);
+    printf("  GPU kernels   : %.3f s, copy back + launch: %.3f s\n",
+           density_ms / 1000, density_time - density_ms / 1000);
     printf("decide agents   : %.3f s (%.1f%% of total)\n", decide_time, 100 * decide_time / total_time);
     
     int nthreads = omp_get_max_threads();
@@ -489,7 +611,8 @@ int main(void)
            max_busy / (sum_busy / nthreads));
     if (out != NULL) {
         fclose(out);
-        printf("saved frames.csv\n");
+        fclose(dout);
+        printf("saved frames.csv and density.csv\n");
     }
     gpu_free();
     return 0;
