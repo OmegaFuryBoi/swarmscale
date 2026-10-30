@@ -1,11 +1,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <omp.h>
 
-#define N      1000      // number of agents
-#define W      100.0f    // world width
-#define H      100.0f    // world height
+#ifndef N
+#define N      1000      // number of agents (change with -DN=... when compiling)
+#endif
+#ifndef STEPS
 #define STEPS  1000      // time steps to simulate
+#endif
+#define DENSITY 0.1f     // agents per unit area (world grows with N)
 #define DT     0.1f      // time step size
 #define VMAX   2.0f      // max speed
 #define PI     3.14159265f
@@ -14,7 +18,9 @@
 #define RSEP       1.0f   // separation radius
 #define SEPARATION 0.5f   // strength of the push away from close neighbours
 #define COHESION   0.02f  // strength of the pull toward the group's centre
-#define SAVE_EVERY 5      // save positions every 5 steps for the animation
+#ifndef SAVE_EVERY
+#define SAVE_EVERY 5      // save positions every 5 steps (0 = don't save)
+#endif
 #define PREY      0
 #define PREDATOR  1
 #define NPRED     10      // the first NPRED agents are predators
@@ -25,6 +31,7 @@
 #define FLEE      1.0f    // how hard prey turn away from a predator
 #define CHASE     0.5f    // how hard predators turn toward their prey
 
+float W, H;              // world size, set in main from N and DENSITY
 float x[N], y[N];        // positions
 float vx[N], vy[N];      // velocities
 float nvx[N], nvy[N];    // new velocities (computed each step)
@@ -198,28 +205,47 @@ float polarization(void)
 
 int main(void)
 {
-    srand(42);           
+    W = H = sqrtf(N / DENSITY);  // keep the same crowding for any N
+    printf("N = %d agents, world %.1f x %.1f, %d steps\n", N, W, H, STEPS);
+
+    srand(42);
     init_agents();
-    FILE *out = fopen("frames.csv", "w");
-    if (out == NULL) {
-        printf("could not open frames.csv\n");
-        return 1;
+
+    FILE *out = NULL;
+    if (SAVE_EVERY > 0) {
+        out = fopen("frames.csv", "w");
+        if (out == NULL) {
+            printf("could not open frames.csv\n");
+            return 1;
+        }
+        fprintf(out, "step,x,y,vx,vy,type\n");
     }
-    fprintf(out, "step,x,y,vx,vy,type\n");      
+
+    double flock_time = 0;                  // time spent in flock_agents
+    double start = omp_get_wtime();
 
     for (int step = 0; step < STEPS; step++) {
+        double t0 = omp_get_wtime();
         flock_agents();
+        flock_time += omp_get_wtime() - t0;
+
         total_catches += catch_prey();
         move_agents();
-        if (step % SAVE_EVERY == 0)
+        if (SAVE_EVERY > 0 && step % SAVE_EVERY == 0)
             save_frame(out, step);
         if (step % 100 == 0)
             printf("step %4d: polarization %.3f | avg neighbours %5.1f | fleeing %3d | catches %d\n",
                    step, polarization(), avg_neighbours, num_fleeing, total_catches);
     }
-    printf("final polarization: %.3f\n", polarization());
-    fclose(out);
-    printf("saved frames.csv\n");
+    double total_time = omp_get_wtime() - start;
 
+    printf("final polarization: %.3f\n", polarization());
+    printf("total time      : %.3f s (%.2f ms per step)\n", total_time, 1000 * total_time / STEPS);
+    printf("flock_agents    : %.3f s (%.1f%% of total)\n", flock_time, 100 * flock_time / total_time);
+
+    if (out != NULL) {
+        fclose(out);
+        printf("saved frames.csv\n");
+    }
     return 0;
 }

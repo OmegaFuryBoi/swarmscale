@@ -4,11 +4,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 
-WORLD = 100                               
+WORLD = None                               
 
 data = np.loadtxt("frames.csv", delimiter=",", skiprows=1)
 steps = np.unique(data[:, 0])
-frames = [data[data[:, 0] == s] for s in steps]  
+frames = [data[data[:, 0] == s] for s in steps]
+WORLD = np.sqrt(len(frames[0]) / 0.1)        
 
 fig, ax = plt.subplots(figsize=(6, 6))
 ax.set_xlim(0, WORLD)
