@@ -23,13 +23,16 @@
 #endif
 #define PREY      0
 #define PREDATOR  1
-#define NPRED     10      // the first NPRED agents are predators
+#define NPRED    (N / 50) // the first 2% of agents are predators
 #define VPRED     2.6f    // predators are a bit faster than prey
 #define RFLEE     8.0f    // prey notice predators within this distance
-#define RHUNT     10.0f   // predators notice prey within this distance
+#define RHUNT     15.0f   // predators notice prey within this distance
 #define RCATCH    1.0f    // a predator this close to its prey catches it
 #define FLEE      1.0f    // how hard prey turn away from a predator
 #define CHASE     0.5f    // how hard predators turn toward their prey
+#define MAXCAND    128    // max prey a predator considers when planning
+#define NLEAD      16     // aiming angles a predator tries for each prey
+#define PLAN_STEPS 200    // how far ahead (in steps) a predator simulates a chase
 
 float W, H;              // world size, set in main from N and DENSITY
 float x[N], y[N];        // positions
@@ -41,6 +44,7 @@ int   type[N];           // PREY or PREDATOR
 int   target[N];         // predator: index of the prey it is chasing (-1 = none)
 int   num_fleeing;       // prey that currently see a predator
 int   total_catches = 0;
+double thread_busy[64];  // seconds each thread spent working in flock_agents
 
 float rand_range(float lo, float hi)
 {
@@ -86,12 +90,51 @@ float wrap_delta(float d, float size)
     return d;
 }
 
+int plan_hunt(int ncand, const int cand[], const float cdx[], const float cdy[],
+              float *hx, float *hy)
+{
+    int best_prey = -1, best_time = PLAN_STEPS + 1;
+
+    for (int c = 0; c < ncand; c++) {
+        int j = cand[c];
+        float base = atan2f(cdy[c], cdx[c]);           
+        for (int k = 0; k < NLEAD; k++) {
+            float angle = base + (k - NLEAD / 2) * 0.15f; 
+            float ux = cosf(angle), uy = sinf(angle);
+            float px = 0, py = 0;                        
+            float qx = cdx[c], qy = cdy[c];              
+            for (int t = 1; t <= PLAN_STEPS; t++) {      
+                px += VPRED * ux * DT;
+                py += VPRED * uy * DT;
+                qx += vx[j] * DT;
+                qy += vy[j] * DT;
+                float ex = qx - px, ey = qy - py;
+                if (ex * ex + ey * ey < RCATCH * RCATCH) { 
+                    if (t < best_time) {
+                        best_time = t;
+                        best_prey = j;
+                        *hx = ux;
+                        *hy = uy;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    return best_prey;
+}
+
 void flock_agents(void)
 {
     long total_neighbours = 0, total_too_close = 0;
     int fleeing = 0;
 
-    #pragma omp parallel for schedule(runtime) reduction(+:total_neighbours, total_too_close, fleeing)
+    #pragma omp parallel reduction(+:total_neighbours, total_too_close, fleeing)
+    {
+    int tid = omp_get_thread_num();
+    double t_start = omp_get_wtime();
+
+    #pragma omp for schedule(runtime) nowait
     for (int i = 0; i < N; i++) {
         float sum_vx = 0, sum_vy = 0;
         float sum_dx = 0, sum_dy = 0;
@@ -101,6 +144,9 @@ void flock_agents(void)
         float best_d2 = (type[i] == PREY) ? RFLEE * RFLEE : RHUNT * RHUNT;
         float best_dx = 0, best_dy = 0;
         int   best_j  = -1;
+        int   ncand = 0;                   
+        int   cand[MAXCAND];
+        float cdx[MAXCAND], cdy[MAXCAND];
 
         for (int j = 0; j < N; j++) {
             if (j == i) continue;
@@ -108,9 +154,13 @@ void flock_agents(void)
             float dy = wrap_delta(y[j] - y[i], H);
             float d2 = dx * dx + dy * dy;
 
-            if (type[i] != type[j]) {                 
+            if (type[i] != type[j]) {
                 if (d2 < best_d2) {
                     best_d2 = d2; best_dx = dx; best_dy = dy; best_j = j;
+                }
+                if (type[i] == PREDATOR && d2 < RHUNT * RHUNT && ncand < MAXCAND) {
+                    cand[ncand] = j; cdx[ncand] = dx; cdy[ncand] = dy;
+                    ncand++;
                 }
             } else if (type[i] == PREY && d2 < R * R) {  
                 sum_vx += vx[j];
@@ -130,7 +180,7 @@ void flock_agents(void)
         nvy[i] = vy[i];
 
         if (type[i] == PREY) {
-            if (count > 0) {                       // the three Boids rules
+            if (count > 0) {                  
                 float avg_vx = sum_vx / count, avg_vy = sum_vy / count;
                 nvx[i] += ALIGN * (avg_vx - vx[i]);
                 nvy[i] += ALIGN * (avg_vy - vy[i]);
@@ -146,12 +196,20 @@ void flock_agents(void)
                 fleeing++;
             }
             total_neighbours += count;
-        } else {                                  
-            target[i] = best_j;
-            if (best_j >= 0) {                    
-                float d = sqrtf(best_d2);
-                nvx[i] += CHASE * VPRED * best_dx / d;
-                nvy[i] += CHASE * VPRED * best_dy / d;
+        } else {                               
+            float hx, hy;
+            int planned = plan_hunt(ncand, cand, cdx, cdy, &hx, &hy);
+            if (planned >= 0) {                   
+                target[i] = planned;
+                nvx[i] += CHASE * VPRED * hx;
+                nvy[i] += CHASE * VPRED * hy;
+            } else {                              
+                target[i] = best_j;
+                if (best_j >= 0) {
+                    float d = sqrtf(best_d2);
+                    nvx[i] += CHASE * VPRED * best_dx / d;
+                    nvy[i] += CHASE * VPRED * best_dy / d;
+                }
             }
         }
 
@@ -161,6 +219,9 @@ void flock_agents(void)
             nvy[i] = nvy[i] / speed * max_speed(i);
         }
     }
+
+    thread_busy[tid] += omp_get_wtime() - t_start;  
+    }   
 
     #pragma omp parallel for
     for (int i = 0; i < N; i++) {
@@ -208,7 +269,7 @@ float polarization(void)
 
 int main(void)
 {
-    W = H = sqrtf(N / DENSITY);  // keep the same crowding for any N
+    W = H = sqrtf(N / DENSITY); 
     printf("N = %d agents, world %.1f x %.1f, %d steps, %d threads\n",
            N, W, H, STEPS, omp_get_max_threads());
 
@@ -225,7 +286,7 @@ int main(void)
         fprintf(out, "step,x,y,vx,vy,type\n");
     }
 
-    double flock_time = 0;                  // time spent in flock_agents
+    double flock_time = 0;               
     double start = omp_get_wtime();
 
     for (int step = 0; step < STEPS; step++) {
@@ -246,7 +307,19 @@ int main(void)
     printf("final polarization: %.3f\n", polarization());
     printf("total time      : %.3f s (%.2f ms per step)\n", total_time, 1000 * total_time / STEPS);
     printf("flock_agents    : %.3f s (%.1f%% of total)\n", flock_time, 100 * flock_time / total_time);
-
+    
+    int nthreads = omp_get_max_threads();
+    double max_busy = 0, sum_busy = 0;
+    for (int t = 0; t < nthreads; t++) {
+        if (thread_busy[t] > max_busy) max_busy = thread_busy[t];
+        sum_busy += thread_busy[t];
+    }
+    printf("thread busy time:\n");
+    for (int t = 0; t < nthreads; t++)
+        printf("  thread %2d: %6.3f s  (%5.1f%% of the busiest)\n",
+               t, thread_busy[t], 100 * thread_busy[t] / max_busy);
+    printf("load imbalance  : %.2f (busiest / average, 1.00 = perfect)\n",
+           max_busy / (sum_busy / nthreads));
     if (out != NULL) {
         fclose(out);
         printf("saved frames.csv\n");
