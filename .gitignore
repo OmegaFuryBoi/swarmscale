@@ -6,3 +6,7 @@ swarm
 
 # editor settings
 .vscode/
+
+# simulation output
+frames.csv
+*.gif

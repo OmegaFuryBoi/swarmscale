@@ -11,10 +11,15 @@
 #define PI     3.14159265f
 #define R      5.0f      // neighbour radius
 #define ALIGN  0.1f      // how strongly agents turn toward neighbours
+#define RSEP       1.0f   // separation radius
+#define SEPARATION 0.5f   // strength of the push away from close neighbours
+#define COHESION   0.02f  // strength of the pull toward the group's centre
 
 float x[N], y[N];        // positions
 float vx[N], vy[N];      // velocities
 float nvx[N], nvy[N];    // new velocities (computed each step)
+float avg_neighbours;    // average neighbours within R
+float avg_too_close;     // average neighbours within RSEP
 
 float rand_range(float lo, float hi)
 {
@@ -54,20 +59,32 @@ float wrap_delta(float d, float size)
     return d;
 }
 
-void align_agents(void)
+void flock_agents(void)
 {
+    long total_neighbours = 0, total_too_close = 0;         
+
     for (int i = 0; i < N; i++) {
-        float sum_vx = 0, sum_vy = 0;
+        float sum_vx = 0, sum_vy = 0;     
+        float sum_dx = 0, sum_dy = 0;     
+        float sep_x = 0, sep_y = 0;       
         int count = 0;
 
-        for (int j = 0; j < N; j++) {            
+        for (int j = 0; j < N; j++) {
             if (j == i) continue;
             float dx = wrap_delta(x[j] - x[i], W);
             float dy = wrap_delta(y[j] - y[i], H);
-            if (dx * dx + dy * dy < R * R) {      
+            float d2 = dx * dx + dy * dy;
+            if (d2 < R * R) {
                 sum_vx += vx[j];
                 sum_vy += vy[j];
+                sum_dx += dx;                                  
+                sum_dy += dy;                                  
                 count++;
+                if (d2 < RSEP * RSEP && d2 > 0) {              
+                    sep_x -= dx / d2;     
+                    sep_y -= dy / d2;
+                    total_too_close++;
+                }
             }
         }
 
@@ -75,21 +92,29 @@ void align_agents(void)
         nvy[i] = vy[i];
         if (count > 0) {
             float avg_vx = sum_vx / count, avg_vy = sum_vy / count;
-            nvx[i] += ALIGN * (avg_vx - vx[i]);   
+            nvx[i] += ALIGN * (avg_vx - vx[i]);                
             nvy[i] += ALIGN * (avg_vy - vy[i]);
+            nvx[i] += COHESION * (sum_dx / count);             
+            nvy[i] += COHESION * (sum_dy / count);
+            nvx[i] += SEPARATION * sep_x;                     
+            nvy[i] += SEPARATION * sep_y;
         }
+        total_neighbours += count;                             
 
         float speed = sqrtf(nvx[i] * nvx[i] + nvy[i] * nvy[i]);
-        if (speed > 0) {                          
+        if (speed > 0) {                
             nvx[i] = nvx[i] / speed * VMAX;
             nvy[i] = nvy[i] / speed * VMAX;
         }
     }
 
-    for (int i = 0; i < N; i++) {                
+    for (int i = 0; i < N; i++) {
         vx[i] = nvx[i];
         vy[i] = nvy[i];
     }
+
+    avg_neighbours = (float)total_neighbours / N;             
+    avg_too_close  = (float)total_too_close / N;               
 }
 
 float polarization(void)
@@ -108,10 +133,11 @@ int main(void)
     init_agents();
 
     for (int step = 0; step < STEPS; step++) {
-        align_agents();
+        flock_agents();
         move_agents();
         if (step % 100 == 0)
-            printf("step %3d: polarization %.3f\n", step, polarization());
+            printf("step %4d: polarization %.3f | avg neighbours %5.1f | too close %.2f\n",
+                   step, polarization(), avg_neighbours, avg_too_close);
     }
     printf("final polarization: %.3f\n", polarization());
 
