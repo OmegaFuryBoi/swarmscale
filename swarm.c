@@ -14,6 +14,7 @@
 #define RSEP       1.0f   // separation radius
 #define SEPARATION 0.5f   // strength of the push away from close neighbours
 #define COHESION   0.02f  // strength of the pull toward the group's centre
+#define SAVE_EVERY 5      // save positions every 5 steps for the animation
 
 float x[N], y[N];        // positions
 float vx[N], vy[N];      // velocities
@@ -117,6 +118,12 @@ void flock_agents(void)
     avg_too_close  = (float)total_too_close / N;               
 }
 
+void save_frame(FILE *f, int step)
+{
+    for (int i = 0; i < N; i++)
+        fprintf(f, "%d,%.3f,%.3f,%.3f,%.3f\n", step, x[i], y[i], vx[i], vy[i]);
+}
+
 float polarization(void)
 {
     float sx = 0, sy = 0;
@@ -131,15 +138,25 @@ int main(void)
 {
     srand(42);           
     init_agents();
+    FILE *out = fopen("frames.csv", "w");
+    if (out == NULL) {
+        printf("could not open frames.csv\n");
+        return 1;
+    }
+    fprintf(out, "step,x,y,vx,vy\n");      
 
     for (int step = 0; step < STEPS; step++) {
         flock_agents();
         move_agents();
+        if (step % SAVE_EVERY == 0)
+            save_frame(out, step);
         if (step % 100 == 0)
             printf("step %4d: polarization %.3f | avg neighbours %5.1f | too close %.2f\n",
                    step, polarization(), avg_neighbours, avg_too_close);
     }
     printf("final polarization: %.3f\n", polarization());
+    fclose(out);
+    printf("saved frames.csv\n");
 
     return 0;
 }
