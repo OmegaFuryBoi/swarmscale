@@ -46,6 +46,18 @@ int   num_fleeing;       // prey that currently see a predator
 int   total_catches = 0;
 double thread_busy[64];  // seconds each thread spent working in flock_agents
 
+float nb_vx[N], nb_vy[N];
+float nb_dx[N], nb_dy[N];
+float nb_sepx[N], nb_sepy[N];
+int   nb_count[N];
+int   nb_close[N];
+float nb_best_d2[N];
+float nb_best_dx[N], nb_best_dy[N];
+int   nb_best_j[N];
+int   nb_ncand[NPRED];
+int   nb_cand[NPRED * MAXCAND];
+float nb_cdx[NPRED * MAXCAND], nb_cdy[NPRED * MAXCAND];
+
 float rand_range(float lo, float hi)
 {
     return lo + (hi - lo) * ((float)rand() / RAND_MAX);
@@ -124,29 +136,19 @@ int plan_hunt(int ncand, const int cand[], const float cdx[], const float cdy[],
     return best_prey;
 }
 
-void flock_agents(void)
+void neighbour_search(void)
 {
-    long total_neighbours = 0, total_too_close = 0;
-    int fleeing = 0;
-
-    #pragma omp parallel reduction(+:total_neighbours, total_too_close, fleeing)
-    {
-    int tid = omp_get_thread_num();
-    double t_start = omp_get_wtime();
-
-    #pragma omp for schedule(runtime) nowait
+    #pragma omp parallel for schedule(runtime)
     for (int i = 0; i < N; i++) {
         float sum_vx = 0, sum_vy = 0;
         float sum_dx = 0, sum_dy = 0;
         float sep_x = 0, sep_y = 0;
-        int count = 0;
+        int count = 0, too_close = 0;
 
         float best_d2 = (type[i] == PREY) ? RFLEE * RFLEE : RHUNT * RHUNT;
         float best_dx = 0, best_dy = 0;
         int   best_j  = -1;
-        int   ncand = 0;                   
-        int   cand[MAXCAND];
-        float cdx[MAXCAND], cdy[MAXCAND];
+        int   ncand   = 0;
 
         for (int j = 0; j < N; j++) {
             if (j == i) continue;
@@ -159,10 +161,12 @@ void flock_agents(void)
                     best_d2 = d2; best_dx = dx; best_dy = dy; best_j = j;
                 }
                 if (type[i] == PREDATOR && d2 < RHUNT * RHUNT && ncand < MAXCAND) {
-                    cand[ncand] = j; cdx[ncand] = dx; cdy[ncand] = dy;
+                    nb_cand[i * MAXCAND + ncand] = j;
+                    nb_cdx[i * MAXCAND + ncand]  = dx;
+                    nb_cdy[i * MAXCAND + ncand]  = dy;
                     ncand++;
                 }
-            } else if (type[i] == PREY && d2 < R * R) {  
+            } else if (type[i] == PREY && d2 < R * R) {
                 sum_vx += vx[j];
                 sum_vy += vy[j];
                 sum_dx += dx;
@@ -171,57 +175,87 @@ void flock_agents(void)
                 if (d2 < RSEP * RSEP && d2 > 0) {
                     sep_x -= dx / d2;
                     sep_y -= dy / d2;
-                    total_too_close++;
+                    too_close++;
                 }
             }
         }
+
+        nb_vx[i] = sum_vx;    nb_vy[i] = sum_vy;
+        nb_dx[i] = sum_dx;    nb_dy[i] = sum_dy;
+        nb_sepx[i] = sep_x;   nb_sepy[i] = sep_y;
+        nb_count[i] = count;  nb_close[i] = too_close;
+        nb_best_d2[i] = best_d2;
+        nb_best_dx[i] = best_dx;
+        nb_best_dy[i] = best_dy;
+        nb_best_j[i]  = best_j;
+        if (type[i] == PREDATOR) nb_ncand[i] = ncand;
+    }
+}
+
+void decide_agents(void)
+{
+    long total_neighbours = 0, total_too_close = 0;
+    int fleeing = 0;
+
+    #pragma omp parallel reduction(+:total_neighbours, total_too_close, fleeing)
+    {
+    int tid = omp_get_thread_num();
+    double t_start = omp_get_wtime();
+
+    #pragma omp for schedule(runtime) nowait
+    for (int i = 0; i < N; i++) {
+        int   count   = nb_count[i];
+        float best_d2 = nb_best_d2[i];
+        int   best_j  = nb_best_j[i];
 
         nvx[i] = vx[i];
         nvy[i] = vy[i];
 
         if (type[i] == PREY) {
-            if (count > 0) {                  
-                float avg_vx = sum_vx / count, avg_vy = sum_vy / count;
+            if (count > 0) {
+                float avg_vx = nb_vx[i] / count, avg_vy = nb_vy[i] / count;
                 nvx[i] += ALIGN * (avg_vx - vx[i]);
                 nvy[i] += ALIGN * (avg_vy - vy[i]);
-                nvx[i] += COHESION * (sum_dx / count);
-                nvy[i] += COHESION * (sum_dy / count);
-                nvx[i] += SEPARATION * sep_x;
-                nvy[i] += SEPARATION * sep_y;
+                nvx[i] += COHESION * (nb_dx[i] / count);
+                nvy[i] += COHESION * (nb_dy[i] / count);
+                nvx[i] += SEPARATION * nb_sepx[i];
+                nvy[i] += SEPARATION * nb_sepy[i];
             }
-            if (best_j >= 0) {                    
+            if (best_j >= 0) {
                 float d = sqrtf(best_d2);
-                nvx[i] -= FLEE * VMAX * best_dx / d;
-                nvy[i] -= FLEE * VMAX * best_dy / d;
+                nvx[i] -= FLEE * VMAX * nb_best_dx[i] / d;
+                nvy[i] -= FLEE * VMAX * nb_best_dy[i] / d;
                 fleeing++;
             }
             total_neighbours += count;
-        } else {                               
+            total_too_close  += nb_close[i];
+        } else {
             float hx, hy;
-            int planned = plan_hunt(ncand, cand, cdx, cdy, &hx, &hy);
-            if (planned >= 0) {                   
+            int planned = plan_hunt(nb_ncand[i], &nb_cand[i * MAXCAND],
+                                    &nb_cdx[i * MAXCAND], &nb_cdy[i * MAXCAND], &hx, &hy);
+            if (planned >= 0) {
                 target[i] = planned;
                 nvx[i] += CHASE * VPRED * hx;
                 nvy[i] += CHASE * VPRED * hy;
-            } else {                              
+            } else {
                 target[i] = best_j;
                 if (best_j >= 0) {
                     float d = sqrtf(best_d2);
-                    nvx[i] += CHASE * VPRED * best_dx / d;
-                    nvy[i] += CHASE * VPRED * best_dy / d;
+                    nvx[i] += CHASE * VPRED * nb_best_dx[i] / d;
+                    nvy[i] += CHASE * VPRED * nb_best_dy[i] / d;
                 }
             }
         }
 
         float speed = sqrtf(nvx[i] * nvx[i] + nvy[i] * nvy[i]);
-        if (speed > 0) {                          
+        if (speed > 0) {
             nvx[i] = nvx[i] / speed * max_speed(i);
             nvy[i] = nvy[i] / speed * max_speed(i);
         }
     }
 
-    thread_busy[tid] += omp_get_wtime() - t_start;  
-    }   
+    thread_busy[tid] += omp_get_wtime() - t_start;
+    }
 
     #pragma omp parallel for
     for (int i = 0; i < N; i++) {
@@ -286,13 +320,17 @@ int main(void)
         fprintf(out, "step,x,y,vx,vy,type\n");
     }
 
-    double flock_time = 0;               
+    double neigh_time = 0, decide_time = 0;
     double start = omp_get_wtime();
 
     for (int step = 0; step < STEPS; step++) {
         double t0 = omp_get_wtime();
-        flock_agents();
-        flock_time += omp_get_wtime() - t0;
+        neighbour_search();
+        double t1 = omp_get_wtime();
+        decide_agents();
+        double t2 = omp_get_wtime();
+        neigh_time  += t1 - t0;
+        decide_time += t2 - t1;
 
         total_catches += catch_prey();
         move_agents();
@@ -306,7 +344,8 @@ int main(void)
 
     printf("final polarization: %.3f\n", polarization());
     printf("total time      : %.3f s (%.2f ms per step)\n", total_time, 1000 * total_time / STEPS);
-    printf("flock_agents    : %.3f s (%.1f%% of total)\n", flock_time, 100 * flock_time / total_time);
+    printf("neighbour search: %.3f s (%.1f%% of total)\n", neigh_time, 100 * neigh_time / total_time);
+    printf("decide agents   : %.3f s (%.1f%% of total)\n", decide_time, 100 * decide_time / total_time);
     
     int nthreads = omp_get_max_threads();
     double max_busy = 0, sum_busy = 0;
