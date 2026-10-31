@@ -38,6 +38,7 @@
 #define BLUR_R     2      // blur mask radius: mask has 2*BLUR_R+1 weights
 #define CONFUSION  20.0f  // penalty (in steps) per unit of crowding around a prey
 #define CAP        (2 * N) // room for local agents + ghost copies
+#define RGHOST     RHUNT  // agents this close to a strip edge are copied to the neighbour
 #define FPA        5      // floats per packed agent: x, y, vx, vy, type
 
 float W, H;              // world size, set in main from N and DENSITY
@@ -56,6 +57,7 @@ int   rank, nprocs;      // this process and how many there are
 int   left, right;       // ranks owning the strips to the left and right
 float xmin, xmax;        // this rank's strip: xmin <= x < xmax
 int   nlocal = 0;        // agents this rank owns
+int   nghost = 0;        // copies of neighbours' border agents (stored after the local ones)
 int   step_catches;      // catches this step on this rank
 float sendbuf_l[N * FPA], sendbuf_r[N * FPA], recvbuf[N * FPA];
 float dens_local[GRID * GRID];
@@ -235,7 +237,7 @@ void neighbour_search(void)
         int   best_j  = -1;
         int   ncand   = 0;
 
-        for (int j = 0; j < nlocal; j++) {
+        for (int j = 0; j < nlocal + nghost; j++) {
             if (j == i) continue;
             float dx = wrap_delta(x[j] - x[i], W);
             float dy = wrap_delta(y[j] - y[i], H);
@@ -359,7 +361,7 @@ int catch_prey(void)
     for (int i = 0; i < nlocal; i++) {
         if (type[i] != PREDATOR) continue;
         int j = target[i];
-        if (j < 0) continue;
+        if (j < 0 || j >= nlocal) continue;
         float dx = wrap_delta(x[j] - x[i], W);
         float dy = wrap_delta(y[j] - y[i], H);
         if (dx * dx + dy * dy < RCATCH * RCATCH) {
@@ -444,6 +446,26 @@ void migrate(void)
     comm_time += MPI_Wtime() - t0;
 }
 
+void exchange_ghosts(void)
+{
+    nghost = 0;
+    if (nprocs == 1) return;
+    double t0 = MPI_Wtime();
+
+    int nl = 0, nr = 0;
+    for (int i = 0; i < nlocal; i++) {
+        if (x[i] - xmin < RGHOST) pack(sendbuf_l, nl++, i);
+        if (xmax - x[i] < RGHOST) pack(sendbuf_r, nr++, i);
+    }
+
+    int n = shift(right, left, sendbuf_r, nr, recvbuf);
+    for (int k = 0; k < n; k++) unpack(recvbuf, k, nlocal + nghost++);
+    n = shift(left, right, sendbuf_l, nl, recvbuf);
+    for (int k = 0; k < n; k++) unpack(recvbuf, k, nlocal + nghost++);
+
+    comm_time += MPI_Wtime() - t0;
+}
+
 void save_density(FILE *f, int step)
 {
     fprintf(f, "%d", step);
@@ -511,9 +533,9 @@ int main(int argc, char **argv)
     xmin  = rank * (W / nprocs);
     xmax  = (rank + 1) * (W / nprocs);
 
-    if (nprocs > 1 && nprocs % 2 != 0) {
+    if (nprocs > 1 && (nprocs % 2 != 0 || W / nprocs < 2 * RGHOST)) {
         if (rank == 0)
-            printf("please use an even number of processes\n");
+            printf("need an even number of processes and strips at least %.0f wide\n", 2 * RGHOST);
         MPI_Finalize();
         return 1;
     }
@@ -561,6 +583,7 @@ int main(int argc, char **argv)
     double start = MPI_Wtime();
 
     for (int step = 0; step < STEPS; step++) {
+        exchange_ghosts();
         double t0 = MPI_Wtime();
         neighbour_search();
         double t1 = MPI_Wtime();
