@@ -57,7 +57,7 @@ int   left, right;       // ranks owning the strips to the left and right
 float xmin, xmax;        // this rank's strip: xmin <= x < xmax
 int   nlocal = 0;        // agents this rank owns
 int   step_catches;      // catches this step on this rank
-float sendbuf_r[N * FPA], recvbuf[N * FPA];
+float sendbuf_l[N * FPA], sendbuf_r[N * FPA], recvbuf[N * FPA];
 float dens_local[GRID * GRID];
 double comm_time = 0;
 
@@ -388,6 +388,62 @@ void pack(float *buf, int k, int i)
     buf[k * FPA + 4] = type[i];
 }
 
+void unpack(const float *buf, int k, int i)
+{
+    x[i]    = buf[k * FPA + 0];
+    y[i]    = buf[k * FPA + 1];
+    vx[i]   = buf[k * FPA + 2];
+    vy[i]   = buf[k * FPA + 3];
+    type[i] = (int)buf[k * FPA + 4];
+}
+
+int shift(int to, int from, const float *sbuf, int nsend, float *rbuf)
+{
+    int nrecv;
+    MPI_Status st;
+    if (rank % 2 == 0) {
+        MPI_Send(&nsend, 1, MPI_INT, to, 0, MPI_COMM_WORLD);
+        MPI_Send(sbuf, nsend * FPA, MPI_FLOAT, to, 1, MPI_COMM_WORLD);
+        MPI_Recv(&nrecv, 1, MPI_INT, from, 0, MPI_COMM_WORLD, &st);
+        MPI_Recv(rbuf, nrecv * FPA, MPI_FLOAT, from, 1, MPI_COMM_WORLD, &st);
+    } else {
+        MPI_Recv(&nrecv, 1, MPI_INT, from, 0, MPI_COMM_WORLD, &st);
+        MPI_Recv(rbuf, nrecv * FPA, MPI_FLOAT, from, 1, MPI_COMM_WORLD, &st);
+        MPI_Send(&nsend, 1, MPI_INT, to, 0, MPI_COMM_WORLD);
+        MPI_Send(sbuf, nsend * FPA, MPI_FLOAT, to, 1, MPI_COMM_WORLD);
+    }
+    return nrecv;
+}
+
+void migrate(void)
+{
+    if (nprocs == 1) return;
+    double t0 = MPI_Wtime();
+
+    int nl = 0, nr = 0, keep = 0;
+    for (int i = 0; i < nlocal; i++) {
+        int o = owner_of(x[i]);
+        if (o == rank) {
+            x[keep] = x[i]; y[keep] = y[i];
+            vx[keep] = vx[i]; vy[keep] = vy[i];
+            type[keep] = type[i];
+            keep++;
+        } else if (o == right) {
+            pack(sendbuf_r, nr++, i);
+        } else {
+            pack(sendbuf_l, nl++, i);
+        }
+    }
+    nlocal = keep;
+
+    int n = shift(right, left, sendbuf_r, nr, recvbuf);
+    for (int k = 0; k < n; k++) unpack(recvbuf, k, nlocal++);
+    n = shift(left, right, sendbuf_l, nl, recvbuf);
+    for (int k = 0; k < n; k++) unpack(recvbuf, k, nlocal++);
+
+    comm_time += MPI_Wtime() - t0;
+}
+
 void save_density(FILE *f, int step)
 {
     fprintf(f, "%d", step);
@@ -455,6 +511,12 @@ int main(int argc, char **argv)
     xmin  = rank * (W / nprocs);
     xmax  = (rank + 1) * (W / nprocs);
 
+    if (nprocs > 1 && nprocs % 2 != 0) {
+        if (rank == 0)
+            printf("please use an even number of processes\n");
+        MPI_Finalize();
+        return 1;
+    }
     if (rank == 0)
         printf("N = %d agents, world %.1f x %.1f, %d steps, %d processes x %d threads\n",
                N, W, H, STEPS, nprocs, omp_get_max_threads());
@@ -512,6 +574,7 @@ int main(int argc, char **argv)
 
         step_catches = catch_prey();
         move_agents();
+        migrate();
         gather_metrics();
 
         if (SAVE_EVERY > 0 && step % SAVE_EVERY == 0) {
